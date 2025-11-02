@@ -48,6 +48,8 @@ export async function processToolCalls<Tools extends ToolSet>({
             "tool-",
             ""
           ) as keyof typeof executions;
+          
+          console.log(`🔧 Found tool invocation: ${toolName}, state: ${part.state}`);
 
           // Only process tools that require confirmation (are in executions object) and are in 'input-available' state
           if (!(toolName in executions) || part.state !== "output-available")
@@ -57,17 +59,24 @@ export async function processToolCalls<Tools extends ToolSet>({
 
           if (part.output === APPROVAL.YES) {
             // User approved the tool execution
+            console.log(`✅ User approved tool: ${toolName}`);
+            console.log(`📥 Tool input:`, JSON.stringify(part.input, null, 2));
+            
             if (!isValidToolName(toolName, executions)) {
+              console.error(`❌ Invalid tool name: ${toolName}`);
               return part;
             }
 
             const toolInstance = executions[toolName];
             if (toolInstance) {
+              console.log(`🚀 Executing tool: ${toolName}`);
               result = await toolInstance(part.input, {
                 messages: convertToModelMessages(messages),
                 toolCallId: part.toolCallId
               });
+              console.log(`✅ Tool ${toolName} completed. Result:`, typeof result === 'string' ? result.substring(0, 100) : 'object');
             } else {
+              console.error(`❌ No execution function found for tool: ${toolName}`);
               result = "Error: No execute function found on tool";
             }
           } else if (part.output === APPROVAL.NO) {

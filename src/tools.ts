@@ -8,6 +8,7 @@ import { z } from "zod/v3";
 import type { Chat } from "./server";
 import { getCurrentAgent } from "agents";
 import { scheduleSchema } from "agents/schedule";
+import { createCalendarEvent as createGoogleCalendarEvent } from "./lib/google-calendar";
 
 /**
  * Weather information tool that requires human confirmation
@@ -33,19 +34,26 @@ const getLocalTime = tool({
   }
 });
 
+// Extended schema to include optional dueDate field
+const extendedScheduleSchema = scheduleSchema.extend({
+  dueDate: z.string().optional().describe("Optional due date for the task (ISO 8601 format or natural language)")
+});
+
 const scheduleTask = tool({
-  description: "A tool to schedule a task to be executed at a later time",
-  inputSchema: scheduleSchema,
-  execute: async ({ when, description }) => {
+  description: "A tool to schedule a task to be executed at a later time. Can optionally include a due date for the task.",
+  inputSchema: extendedScheduleSchema,
+  execute: async ({ dueDate, when, description }) => {
     // we can now read the agent context from the ALS store
     const { agent } = getCurrentAgent<Chat>();
 
     function throwError(msg: string): string {
       throw new Error(msg);
     }
+    
     if (when.type === "no-schedule") {
       return "Not a valid schedule input";
     }
+    
     const input =
       when.type === "scheduled"
         ? when.date // scheduled
@@ -54,13 +62,23 @@ const scheduleTask = tool({
           : when.type === "cron"
             ? when.cron // cron
             : throwError("not a valid schedule input");
+    
+    // Create enhanced description that includes due date if provided
+    const taskDescription = dueDate 
+      ? `${description} (Due: ${dueDate})`
+      : description;
+    
     try {
-      agent!.schedule(input!, "executeTask", description);
+      agent!.schedule(input!, "executeTask", taskDescription);
     } catch (error) {
       console.error("error scheduling task", error);
       return `Error scheduling task: ${error}`;
     }
-    return `Task scheduled for type "${when.type}" : ${input}`;
+    
+    const response = `Task scheduled for type "${when.type}": ${input}`;
+    return dueDate 
+      ? `${response} with due date: ${dueDate}`
+      : response;
   }
 });
 
@@ -109,6 +127,26 @@ const cancelScheduledTask = tool({
 });
 
 /**
+ * Google Calendar tool that requires human confirmation
+ * Creates a calendar event/block in the user's Google Calendar
+ */
+const createCalendarEvent = tool({
+  description: "CALL THIS TOOL when the user wants to: block time, schedule a meeting, add to calendar, create calendar event, or put something on their schedule. This creates real events in their Google Calendar. REQUIRED when user mentions calendar, meeting, appointment, or scheduling.",
+  inputSchema: z.object({
+    title: z.string().describe("Event title (extract from user's request, e.g., 'Code Review', 'Team Meeting')"),
+    description: z.string().optional().describe("Optional description or details for the event"),
+    startTime: z.string().describe("Start time - use natural language like 'tomorrow at 2pm', 'Monday at 9am', 'Friday 3pm', or ISO format"),
+    endTime: z.string().optional().describe("End time in natural language or ISO format. Defaults to 1 hour after start if not provided"),
+    location: z.string().optional().describe("Optional location for the event"),
+    attendees: z.array(z.string()).optional().describe("Optional list of email addresses to invite")
+  })
+  // Omitting execute function makes this tool require human confirmation
+});
+
+
+
+
+/**
  * Export all available tools
  * These will be provided to the AI model to describe available capabilities
  */
@@ -117,7 +155,8 @@ export const tools = {
   getLocalTime,
   scheduleTask,
   getScheduledTasks,
-  cancelScheduledTask
+  cancelScheduledTask,
+  createCalendarEvent
 } satisfies ToolSet;
 
 /**
@@ -129,5 +168,62 @@ export const executions = {
   getWeatherInformation: async ({ city }: { city: string }) => {
     console.log(`Getting weather information for ${city}`);
     return `The weather in ${city} is sunny`;
+  },
+  createCalendarEvent: async (input: {
+    title: string;
+    description?: string;
+    startTime: string;
+    endTime?: string;
+    location?: string;
+    attendees?: string[];
+  }) => {
+    try {
+      console.log("Creating calendar event with input:", JSON.stringify(input, null, 2));
+      
+      // Get environment variables - try multiple methods
+      let env: {
+        GOOGLE_CLIENT_ID?: string;
+        GOOGLE_CLIENT_SECRET?: string;
+        GOOGLE_REFRESH_TOKEN?: string;
+      } | undefined = undefined;
+      
+      // Method 1: Try to get from global env (Workers runtime)
+      // In Cloudflare Workers, env vars from .dev.vars are available via globalThis or process.env
+      if (typeof process !== 'undefined' && process.env) {
+        env = {
+          GOOGLE_CLIENT_ID: process.env.GOOGLE_CLIENT_ID,
+          GOOGLE_CLIENT_SECRET: process.env.GOOGLE_CLIENT_SECRET,
+          GOOGLE_REFRESH_TOKEN: process.env.GOOGLE_REFRESH_TOKEN,
+        };
+        console.log("Using process.env for credentials");
+      }
+      
+      // Method 2: Check if credentials are actually loaded
+      if (!env?.GOOGLE_CLIENT_ID || !env?.GOOGLE_CLIENT_SECRET || !env?.GOOGLE_REFRESH_TOKEN) {
+        console.error("❌ Missing Google Calendar credentials!");
+        console.log("CLIENT_ID:", env?.GOOGLE_CLIENT_ID ? "✓" : "✗");
+        console.log("CLIENT_SECRET:", env?.GOOGLE_CLIENT_SECRET ? "✓" : "✗");
+        console.log("REFRESH_TOKEN:", env?.GOOGLE_REFRESH_TOKEN ? "✓" : "✗");
+        throw new Error(
+          "Google Calendar credentials not found. " +
+          "Make sure GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REFRESH_TOKEN " +
+          "are set in your .dev.vars file and restart the dev server."
+        );
+      }
+      
+      const result = await createGoogleCalendarEvent(input, env);
+      
+      console.log("✅ Calendar event created successfully:", result);
+      return result;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      console.error("❌ Error in createCalendarEvent:", errorMessage);
+      console.error("Full error:", error);
+      
+      // Return detailed error message so user can see what went wrong
+      return `❌ Failed to create calendar event: ${errorMessage}\n\nPossible causes:\n- Credentials missing from .dev.vars\n- Need to restart dev server after adding credentials\n- Invalid or expired refresh token\n- Google Calendar API not enabled\n- Network error\n\nCheck the server console for more details.`;
+    }
   }
 };
+
+

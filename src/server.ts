@@ -13,12 +13,10 @@ import {
   createUIMessageStreamResponse,
   type ToolSet
 } from "ai";
-import { openai } from "@ai-sdk/openai";
+//import { openai } from "@ai-sdk/openai";
+import { createWorkersAI } from 'workers-ai-provider';
 import { processToolCalls, cleanupMessages } from "./utils";
 import { tools, executions } from "./tools";
-// import { env } from "cloudflare:workers";
-
-const model = openai("gpt-4o-2024-11-20");
 // Cloudflare AI Gateway
 // const openai = createOpenAI({
 //   apiKey: env.OPENAI_API_KEY,
@@ -40,6 +38,14 @@ export class Chat extends AIChatAgent<Env> {
     //   "https://path-to-mcp-server/sse"
     // );
 
+    // Initialize Workers AI with the binding from this.env (Workers runtime)
+    const workersai = createWorkersAI({ binding: this.env.AI });
+    
+    // Try Llama 3.1 which may have better tool calling support
+    // Fallback to DeepSeek if Llama doesn't work
+    const model = workersai("@cf/meta/llama-3.1-8b-instruct" as any);
+    // Alternative: workersai("@cf/deepseek-ai/deepseek-r1-distill-qwen-32b" as any);
+
     // Collect all tools, including MCP tools
     const allTools = {
       ...tools,
@@ -60,12 +66,80 @@ export class Chat extends AIChatAgent<Env> {
           executions
         });
 
+        console.log("🔧 Available tools:", Object.keys(allTools));
+        console.log("📝 Current messages:", cleanedMessages.length);
+
+        // Analyze user's last message to detect intent
+        const lastUserMessage = cleanedMessages
+          .filter(m => m.role === 'user')
+          .slice(-1)[0];
+        
+        const userText = lastUserMessage?.parts
+          ?.find(p => p.type === 'text')
+          ?.text?.toLowerCase() || '';
+        
+        const wantsCalendar = userText.includes('calendar') || 
+                              userText.includes('block') || 
+                              userText.includes('meeting') || 
+                              userText.includes('schedule') ||
+                              userText.includes('add to') ||
+                              userText.includes('put on');
+        
+        console.log("👤 User intent - wants calendar:", wantsCalendar, "Text:", userText.substring(0, 50));
+
         const result = streamText({
-          system: `You are a helpful assistant that can do various tasks... 
+          system: `You are an AI assistant that MUST use tools to perform actions. DO NOT just describe what you would do - ACTUALLY CALL THE TOOLS.
+
+${wantsCalendar ? `
+🚨 USER WANTS TO CREATE A CALENDAR EVENT 🚨
+You MUST call the createCalendarEvent tool NOW. Do not describe it, do not think about it - CALL IT IMMEDIATELY.
+` : ''}
+
+CRITICAL RULES:
+1. When a user asks for ANY action (schedule, block time, calendar, meeting, etc.), you MUST call a tool
+2. If you don't call a tool, you are FAILING your task
+3. Tools are the ONLY way to perform actions - describing actions is not acceptable
+4. Think of tools as functions you MUST call, not suggestions
 
 ${getSchedulePrompt({ date: new Date() })}
 
-If the user asks to schedule a task, use the schedule tool to schedule the task.
+TOOL USAGE RULES:
+1. **createCalendarEvent** - MANDATORY when user says:
+   - "block time", "block my calendar", "add to calendar"
+   - "schedule a meeting", "create calendar event", "schedule"
+   - "put on my calendar", "add to my schedule"
+   - ANY request mentioning "calendar", "meeting", "appointment"
+   → YOU MUST CALL THIS TOOL - do not describe, CALL IT
+
+2. **scheduleTask** - Only for internal task reminders (NOT calendar events)
+
+TOOL DESCRIPTIONS:
+- createCalendarEvent: Creates events in Google Calendar. Takes: title (string), startTime (string), optional endTime, description, location, attendees. REQUIRES USER APPROVAL.
+- scheduleTask: Schedules internal tasks (not calendar events)
+- getLocalTime: Gets time in a location
+- getWeatherInformation: Gets weather (requires approval)
+- getScheduledTasks: Lists scheduled tasks
+- cancelScheduledTask: Cancels a task
+
+EXAMPLE CONVERSATION:
+User: "Block my calendar for a code review tomorrow at 2pm"
+You: [IMMEDIATELY CALL createCalendarEvent with {"title": "Code Review", "startTime": "tomorrow at 2pm"}]
+Do NOT say "I would create..." - CALL THE TOOL!
+
+User: "Schedule a meeting for Monday at 9am"
+You: [IMMEDIATELY CALL createCalendarEvent with {"title": "Meeting", "startTime": "Monday at 9am"}]
+
+User: "Add doctor appointment to calendar Friday 3pm"
+You: [IMMEDIATELY CALL createCalendarEvent with {"title": "Doctor Appointment", "startTime": "Friday at 3pm"}]
+
+REMEMBER:
+- Extract title from user request
+- Parse time (accept natural language: "tomorrow at 2pm", "Monday 9am", etc.)
+- Call createCalendarEvent immediately
+- Wait for approval
+- Then respond with confirmation
+
+${wantsCalendar ? '⚠️ USER IS REQUESTING A CALENDAR EVENT - YOU MUST CALL createCalendarEvent TOOL NOW! ⚠️' : ''}
 `,
 
           messages: convertToModelMessages(processedMessages),
@@ -73,7 +147,18 @@ If the user asks to schedule a task, use the schedule tool to schedule the task.
           tools: allTools,
           // Type boundary: streamText expects specific tool types, but base class uses ToolSet
           // This is safe because our tools satisfy ToolSet interface (verified by 'satisfies' in tools.ts)
-          onFinish: onFinish as unknown as StreamTextOnFinishCallback<
+          onFinish: (async (result: Parameters<typeof onFinish>[0]) => {
+            console.log("✅ Stream finished");
+            if (result.toolCalls && result.toolCalls.length > 0) {
+              console.log("🔧 Tool calls made:", result.toolCalls.map((tc: { toolName: string }) => tc.toolName));
+            } else {
+              console.warn("⚠️ No tool calls were made!");
+              if (wantsCalendar) {
+                console.error("❌ ERROR: User wanted calendar event but no tool was called!");
+              }
+            }
+            return await onFinish(result);
+          }) as unknown as StreamTextOnFinishCallback<
             typeof allTools
           >,
           stopWhen: stepCountIs(10)

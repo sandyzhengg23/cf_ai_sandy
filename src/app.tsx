@@ -29,7 +29,8 @@ import {
 // List of tools that require human confirmation
 // NOTE: this should match the tools that don't have execute functions in tools.ts
 const toolsRequiringConfirmation: (keyof typeof tools)[] = [
-  "getWeatherInformation"
+  "getWeatherInformation",
+  "createCalendarEvent"
 ];
 
 export default function Chat() {
@@ -194,6 +195,16 @@ export default function Chat() {
 
         {/* Messages */}
         <div className="flex-1 overflow-y-auto p-4 space-y-4 pb-24 max-h-[calc(100vh-10rem)]">
+          {/* Show agent thinking indicator when streaming */}
+          {status === "streaming" && (
+            <div className="flex items-center gap-2 text-sm text-[#F48120] mb-2">
+              <div className="animate-pulse">
+                <Robot size={16} />
+              </div>
+              <span className="font-medium">Agent is thinking and may use tools...</span>
+            </div>
+          )}
+          
           {agentMessages.length === 0 && (
             <div className="h-full flex items-center justify-center">
               <Card className="p-6 max-w-md mx-auto bg-neutral-100 dark:bg-neutral-900">
@@ -203,17 +214,28 @@ export default function Chat() {
                   </div>
                   <h3 className="font-semibold text-lg">Welcome to AI Chat</h3>
                   <p className="text-muted-foreground text-sm">
-                    Start a conversation with your AI assistant. Try asking
-                    about:
+                    Start a conversation with your AI assistant. Watch as the agent uses tools to help you!
+                  </p>
+                  <div className="mt-3 p-2 bg-[#F48120]/10 rounded-md border border-[#F48120]/30">
+                    <p className="text-xs text-[#F48120] font-medium mb-1">
+                      🤖 Agentic Behavior: The agent will show tool usage cards when it needs to use tools to answer your questions
+                    </p>
+                  </div>
+                  <p className="text-muted-foreground text-sm mt-3">
+                    Try asking about:
                   </p>
                   <ul className="text-sm text-left space-y-2">
                     <li className="flex items-center gap-2">
                       <span className="text-[#F48120]">•</span>
-                      <span>Weather information for any city</span>
+                      <span>Weather information for any city (requires approval)</span>
                     </li>
                     <li className="flex items-center gap-2">
                       <span className="text-[#F48120]">•</span>
-                      <span>Local time in different locations</span>
+                      <span>Local time in different locations (auto-executes)</span>
+                    </li>
+                    <li className="flex items-center gap-2">
+                      <span className="text-[#F48120]">•</span>
+                      <span>Schedule a task with a due date</span>
                     </li>
                   </ul>
                 </div>
@@ -226,6 +248,14 @@ export default function Chat() {
             const showAvatar =
               index === 0 || agentMessages[index - 1]?.role !== m.role;
 
+            // Check if this message has tool invocations
+            const hasToolInvocations = m.parts?.some((part) =>
+              isToolUIPart(part)
+            );
+            const activeToolInvocations = m.parts?.filter((part) =>
+              isToolUIPart(part)
+            );
+
             return (
               <div key={m.id}>
                 {showDebug && (
@@ -233,6 +263,51 @@ export default function Chat() {
                     {JSON.stringify(m, null, 2)}
                   </pre>
                 )}
+                
+                {/* Show tool invocations prominently before the message */}
+                {!isUser && hasToolInvocations && activeToolInvocations && (
+                  <div className="mb-3 flex flex-col gap-2">
+                    <div className="flex items-center gap-2 text-xs text-[#F48120] font-semibold mb-1">
+                      <Robot size={14} />
+                      <span>Agent is using tools:</span>
+                    </div>
+                    {activeToolInvocations.map((part, toolIndex) => {
+                      if (!isToolUIPart(part)) return null;
+                      const toolCallId = part.toolCallId;
+                      const toolName = part.type.replace("tool-", "");
+                      const needsConfirmation =
+                        toolsRequiringConfirmation.includes(
+                          toolName as keyof typeof tools
+                        );
+
+                      if (showDebug) return null;
+
+                      return (
+                        <ToolInvocationCard
+                          key={`${toolCallId}-${toolIndex}`}
+                          toolUIPart={part}
+                          toolCallId={toolCallId}
+                          needsConfirmation={needsConfirmation}
+                          onSubmit={({ toolCallId, result }) => {
+                            addToolResult({
+                              tool: part.type.replace("tool-", ""),
+                              toolCallId,
+                              output: result
+                            });
+                          }}
+                          addToolResult={(toolCallId, result) => {
+                            addToolResult({
+                              tool: part.type.replace("tool-", ""),
+                              toolCallId,
+                              output: result
+                            });
+                          }}
+                        />
+                      );
+                    })}
+                  </div>
+                )}
+
                 <div
                   className={`flex ${isUser ? "justify-end" : "justify-start"}`}
                 >
@@ -250,6 +325,9 @@ export default function Chat() {
                     <div>
                       <div>
                         {m.parts?.map((part, i) => {
+                          // Skip tool parts here since we show them above
+                          if (isToolUIPart(part)) return null;
+
                           if (part.type === "text") {
                             return (
                               // biome-ignore lint/suspicious/noArrayIndexKey: immutable index
@@ -292,45 +370,6 @@ export default function Chat() {
                                   )}
                                 </p>
                               </div>
-                            );
-                          }
-
-                          if (
-                            isToolUIPart(part) &&
-                            m.id.startsWith("assistant")
-                          ) {
-                            const toolCallId = part.toolCallId;
-                            const toolName = part.type.replace("tool-", "");
-                            const needsConfirmation =
-                              toolsRequiringConfirmation.includes(
-                                toolName as keyof typeof tools
-                              );
-
-                            // Skip rendering the card in debug mode
-                            if (showDebug) return null;
-
-                            return (
-                              <ToolInvocationCard
-                                // biome-ignore lint/suspicious/noArrayIndexKey: using index is safe here as the array is static
-                                key={`${toolCallId}-${i}`}
-                                toolUIPart={part}
-                                toolCallId={toolCallId}
-                                needsConfirmation={needsConfirmation}
-                                onSubmit={({ toolCallId, result }) => {
-                                  addToolResult({
-                                    tool: part.type.replace("tool-", ""),
-                                    toolCallId,
-                                    output: result
-                                  });
-                                }}
-                                addToolResult={(toolCallId, result) => {
-                                  addToolResult({
-                                    tool: part.type.replace("tool-", ""),
-                                    toolCallId,
-                                    output: result
-                                  });
-                                }}
-                              />
                             );
                           }
                           return null;
